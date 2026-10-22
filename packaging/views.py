@@ -48,3 +48,9 @@ def recommend_box_view(request, order_id):
     })
 
 
+from django.shortcuts import render
+
+
+def dashboard_view(request):
+    return render(request, "packaging/dashboard.html")
+

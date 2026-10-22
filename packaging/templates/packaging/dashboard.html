@@ -1,0 +1,107 @@
+
+{% load static %}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PackWise | Warehouse Dashboard</title>
+    <link rel="stylesheet" href="{% static 'packaging/css/style.css' %}">
+    <script src="{% static 'packaging/js/dashboard.js' %}" defer></script>
+</head>
+<body>
+    <aside class="sidebar">
+        <h2 class="brand">PackWise<span>.</span></h2>
+        <p class="sidebar-label">WORKSPACE</p>
+        <a class="nav-link active" href="/">Dashboard</a>
+        <a class="nav-link" href="/admin/">Manage Inventory</a>
+        <div class="sidebar-footer">Warehouse Operations</div>
+    </aside>
+
+    <main class="main-content">
+        <header class="topbar">
+            <div>
+                <p class="eyebrow">WAREHOUSE / OVERVIEW</p>
+                <h1>Packaging Dashboard</h1>
+                <p class="subtitle">
+                    Find the most cost-effective box for every order.
+                </p>
+            </div>
+            <span class="status-pill">● System ready</span>
+        </header>
+
+        <section class="stats-grid">
+            <article class="stat-card">
+                <p>Order selected</p>
+                <h2 id="selected-order">—</h2>
+            </article>
+            <article class="stat-card">
+                <p>Package weight</p>
+                <h2 id="total-weight">—</h2>
+            </article>
+            <article class="stat-card">
+                <p>Recommended cost</p>
+                <h2 id="box-cost">—</h2>
+            </article>
+        </section>
+
+        <section class="panel">
+            <div class="panel-heading">
+                <div>
+                    <h2>Find a shipping box</h2>
+                    <p>Enter an existing order ID to calculate a recommendation.</p>
+                </div>
+            </div>
+
+            <form id="recommendation-form">
+                <label for="order-id">Order ID</label>
+                <div class="form-row">
+                    <input
+                        type="number"
+                        id="order-id"
+                        min="1"
+                        placeholder="e.g. 1"
+                        required
+                    >
+                    <button type="submit" id="recommend-button">
+                        Recommend box →
+                    </button>
+                </div>
+            </form>
+
+            <p id="feedback" class="feedback" role="status" aria-live="polite">
+                Enter an order ID to get started.
+            </p>
+        </section>
+
+        <section class="panel result-panel" id="result-panel" hidden>
+            <div class="panel-heading">
+                <div>
+                    <p class="eyebrow">RECOMMENDATION</p>
+                    <h2 id="recommended-box">—</h2>
+                </div>
+                <span class="status-pill">Best available match</span>
+            </div>
+
+            <div class="result-grid">
+                <div class="result-item">
+                    <span>Internal dimensions</span>
+                    <strong id="box-dimensions">—</strong>
+                </div>
+                <div class="result-item">
+                    <span>Maximum weight</span>
+                    <strong id="max-weight">—</strong>
+                </div>
+                <div class="result-item">
+                    <span>Total order weight</span>
+                    <strong id="result-weight">—</strong>
+                </div>
+                <div class="result-item">
+                    <span>Box cost</span>
+                    <strong id="result-cost">—</strong>
+                </div>
+            </div>
+        </section>
+    </main>
+</body>
+</html>
