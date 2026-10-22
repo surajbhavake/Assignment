@@ -102,6 +102,26 @@ class BoxRecommendationTests(TestCase):
         self.assertTrue(result["success"])
         self.assertEqual(result["box"].name, "Medium")
 
+    def test_inactive_box_is_not_recommended(self):
+        ShippingBox.objects.filter(name="Small").update(
+            is_active=False
+        )
+
+        result = recommend_box(self.order)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["box"].name, "Medium")
+
+    def test_no_box_fits_returns_failure(self):
+        ShippingBox.objects.all().update(is_active=False)
+
+        result = recommend_box(self.order)
+
+        self.assertFalse(result["success"])
+        self.assertIn("No available box", result["message"])
+
+
+
 from rest_framework.test import APITestCase
 from rest_framework import status
 
@@ -113,7 +133,4 @@ class RecommendationAPITests(APITestCase):
             "/api/orders/999999/recommend-box/"
         )
 
-        self.assertEqual(
-            response.status_code,
-            status.HTTP_404_NOT_FOUND,
-        )
+        self.assertEqual(response.status_code, 404)

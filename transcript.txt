@@ -1,0 +1,1174 @@
+We operate an ecommerce platform. When a customer places an order, the warehouse team
+needs to know which shipping box should be used. Each product has dimensions and
+weight. Each box has internal dimensions, maximum weight capacity, and cost.
+Your task is to design and build a small Django-based system that recommends the most
+suitable box for an order.
+
+
+# Django Shipping Box Recommendation System
+
+For this project, I’d build a small Django application that takes an ecommerce order, checks the dimensions and weights of its products, and recommends the lowest-cost suitable shipping box that can safely accommodate the entire order.
+
+The important part is that the system must handle multiple products in one order, not just select a box for an individual product.
+
+## 1. How the system will work
+
+1\. Customer places an order
+
+Order items, quantities, product dimensions and weights
+
+2\. Calculate package requirements
+
+Combined weight and a feasible arrangement of all products
+
+3\. Evaluate available boxes
+
+Internal dimensions, weight capacity and box cost
+
+4\. Recommend the best box
+
+Select the cheapest box that satisfies all constraints, or explain why no box fits.
+
+## 2. Recommended technology stack
+
+- Backend: Python and Django
+- API: Django REST Framework (optional, but useful for a warehouse dashboard)
+- Database: SQLite for the initial version; PostgreSQL for production
+- Testing: Django's built-in test framework
+- Interface: Django templates for a simple warehouse page, or React if a separate frontend is needed
+
+For a small assignment, Django with SQLite and server-rendered templates is sufficient. You can add REST APIs if the ecommerce platform needs to call the recommendation engine.
+
+## 3. Database design
+
+We need four main models: `Product`, `ShippingBox`, `Order`, and `OrderItem`.
+
+| Model       | Important fields                                       |
+| ----------- | ------------------------------------------------------ |
+| Product     | Name, length, width, height, unit weight               |
+| ShippingBox | Name, internal length, width, height, max weight, cost |
+| Order       | Order number, creation date, status                    |
+| OrderItem   | Order, product, quantity                               |
+
+Use one consistent unit throughout the system: centimeters for dimensions, kilograms for weight, and rupees for cost.
+
+The `OrderItem` model connects products to orders and stores quantities. For example, an order with three units of one product and two units of another contains two order-item records.
+
+## 4. Create the Django project
+
+Run these commands in your terminal:
+
+```
+python -m venv venv
+
+# Linux/macOS
+source venv/bin/activate
+
+# Install dependencies
+pip install django djangorestframework
+
+django-admin startproject shipping_system .
+python manage.py startapp packaging
+```
+
+Add the apps to `shipping_system/settings.py`:
+
+```
+INSTALLED_APPS = [    # Default Django apps...    "rest_framework",    "packaging",]
+```
+
+## 5. Define the database models
+
+In `packaging/models.py`:
+
+```
+from django.core.validators import MinValueValidatorfrom django.db import modelsclass Product(models.Model):    name = models.CharField(max_length=200)    length = models.DecimalField(max_digits=10, decimal_places=2)    width = models.DecimalField(max_digits=10, decimal_places=2)    height = models.DecimalField(max_digits=10, decimal_places=2)    weight = models.DecimalField(max_digits=10, decimal_places=3)    def __str__(self):        return self.nameclass ShippingBox(models.Model):    name = models.CharField(max_length=100)    length = models.DecimalField(max_digits=10, decimal_places=2)    width = models.DecimalField(max_digits=10, decimal_places=2)    height = models.DecimalField(max_digits=10, decimal_places=2)    max_weight = models.DecimalField(        max_digits=10, decimal_places=3    )    cost = models.DecimalField(max_digits=10, decimal_places=2)    is_active = models.BooleanField(default=True)    def __str__(self):        return self.nameclass Order(models.Model):    order_number = models.CharField(max_length=50, unique=True)    created_at = models.DateTimeField(auto_now_add=True)    def __str__(self):        return self.order_numberclass OrderItem(models.Model):    order = models.ForeignKey(        Order, on_delete=models.CASCADE, related_name="items"    )    product = models.ForeignKey(        Product, on_delete=models.PROTECT    )    quantity = models.PositiveIntegerField(        validators=[MinValueValidator(1)]    )    class Meta:        constraints = [            models.CheckConstraint(                condition=models.Q(quantity__gte=1),                name="order_item_quantity_at_least_one",            )        ]
+```
+
+Then create the database tables:
+
+```
+python manage.py makemigrations
+python manage.py migrate
+python manage.py createsuperuser
+```
+
+Register the models in `packaging/admin.py` so warehouse administrators can add products and boxes:
+
+```
+from django.contrib import adminfrom .models import Product, ShippingBox, Order, OrderItemadmin.site.register(Product)admin.site.register(ShippingBox)admin.site.register(Order)admin.site.register(OrderItem)
+```
+
+You can now manage your initial product catalog and box inventory at `/admin/`.
+
+## 6. Design the recommendation algorithm
+
+The algorithm should follow these rules:
+
+1. Calculate the total weight of every product in the order, including quantities.
+2. Reject boxes whose maximum weight capacity is too low.
+3. Check whether every product can fit inside the box in at least one permitted orientation.
+4. Check whether all products can fit together without overlapping or exceeding the box's internal dimensions.
+5. Among the feasible boxes, choose the one with the lowest cost.
+6. If two boxes have the same cost, prefer the smaller box by internal volume.
+
+An important engineering detail: checking each product individually, or checking only the combined product volume, does not guarantee that the complete order fits. For a reliable recommendation, the system needs a three-dimensional packing check.
+
+For an initial version, assume products are rectangular, can be rotated in 90-degree increments, and can be placed next to or on top of each other. Fragile-item constraints, protective packaging and non-stackable items can be added later.
+
+## 7. Implement the box recommendation service
+
+Create `packaging/services.py`. This service contains the core business logic, separate from Django views so it can be reused by an API, warehouse dashboard, or automated order-processing workflow.
+
+The following is a practical greedy 3D packing heuristic. It tries different orientations and placement positions, prioritizing larger products first. It is suitable as a starting point, but it is not a mathematical guarantee that every possible valid arrangement will be found.
+
+```
+from itertools import permutationsdef orientations(dimensions):    """Return unique 90-degree rotations of a rectangular item."""    return set(permutations(tuple(float(x) for x in dimensions)))def overlaps(a, b):    """Check whether two placed cuboids overlap."""    ax, ay, az, al, aw, ah = a    bx, by, bz, bl, bw, bh = b    return (        ax < bx + bl and ax + al > bx        and ay < by + bw and ay + aw > by        and az < bz + bh and az + ah > bz    )def can_pack(items, box_dimensions):    """    items: list of (length, width, height) tuples.    box_dimensions: (length, width, height).    Greedy placement; False means this heuristic could    not find an arrangement, not necessarily that none exists.    """    L, W, H = map(float, box_dimensions)    # Try the largest products first.    items = sorted(        items,        key=lambda d: d[0] * d[1] * d[2],        reverse=True,
+```
+
+This implementation assumes that product dimensions are accurate and that items can be packed without extra clearance. In production, account for packaging material, dimensional tolerances and any handling restrictions. For orders where packing correctness is critical, replace the greedy heuristic with a stronger 3D bin-packing solver or an exact search for small orders.
+
+## 8. Expose the recommendation through an API
+
+Create `packaging/serializers.py`:
+
+```
+from rest_framework import serializersfrom .models import Orderclass OrderSerializer(serializers.ModelSerializer):    class Meta:        model = Order        fields = ["id", "order_number", "created_at"]
+```
+
+Create `packaging/views.py`:
+
+```
+from rest_framework.decorators import api_viewfrom rest_framework.response import Responsefrom rest_framework import statusfrom .models import Orderfrom .services import recommend_box@api_view(["GET"])def recommend_box_view(request, order_id):    try:        order = Order.objects.get(pk=order_id)    except Order.DoesNotExist:        return Response(            {"error": "Order not found."},            status=status.HTTP_404_NOT_FOUND,        )    result = recommend_box(order)    if not result["success"]:        return Response(            result,            status=status.HTTP_422_UNPROCESSABLE_ENTITY,        )    box = result["box"]    return Response({        "order_id": order.id,        "order_number": order.order_number,        "recommended_box": {            "id": box.id,            "name": box.name,            "dimensions_cm": {
+```
+
+In `packaging/urls.py`:
+
+```
+from django.urls import pathfrom .views import recommend_box_viewurlpatterns = [    path(        "orders/<int:order_id>/recommend-box/",        recommend_box_view,        name="recommend-box",    ),]
+```
+
+In `shipping_system/urls.py`:
+
+```
+from django.contrib import adminfrom django.urls import path, includeurlpatterns = [    path("admin/", admin.site.urls),    path("api/", include("packaging.urls")),]
+```
+
+Start the server:
+
+```
+python manage.py runserver
+```
+
+Call the recommendation endpoint using an existing order ID:
+
+```
+GET http://127.0.0.1:8000/api/orders/1/recommend-box/
+```
+
+## 9. Example scenario
+
+Suppose the warehouse has these boxes and an order contains two products.
+
+### Order contents
+
+[Cardboard box isolated on a white background](https://images.openai.com/static-rsc-4/0ynaWz9iXIpBM8eDvjIrKWo7UbXWXlqINebdnjeCXevr9rVm-cSH7gzYjHeVlWr67VkI_hSd9haU9GfMHo1xriGXvXOvixu6_2ID6iMPdo8G-cDnD5Vho-HskNmjtyOMKTwHFlgOMhXWts-V6qI8GCJoz53WD3Ru-rl8L7ioNCxbloY4CJdRX7lq9MjcsQte?purpose=inline)
+
+Product A × 1
+
+20 × 15 × 10 cm · 1 kg
+
+Product B × 1
+
+15 × 10 × 5 cm · 0.5 kg
+
+### Available boxes
+
+| Box    | Internal dimensions | Max weight | Cost |
+| ------ | ------------------- | ---------- | ---- |
+| Small  | 25 × 20 × 15 cm     | 2 kg       | ₹20  |
+| Medium | 35 × 25 × 20 cm     | 5 kg       | ₹30  |
+| Large  | 45 × 35 × 30 cm     | 10 kg      | ₹50  |
+
+The total product weight is 1.5 kg. Both the small and medium boxes can accommodate these products, so the recommended box is Small, costing ₹20, provided the packing check succeeds.
+
+## 10. Testing checklist
+
+Before considering the system complete, test these scenarios:
+
+- A single product that fits exactly within a box.
+- A product that fits only when rotated.
+- Multiple products that fit individually but cannot fit together.
+- An order whose total weight exceeds every box's capacity.
+- An order with zero items.
+- An inactive box that would otherwise be the cheapest.
+- Multiple feasible boxes with different costs.
+- An order with a product quantity greater than one.
+
+For production use, I would also add an order status such as `pending`, `recommended`, and `packed`, plus a record of the selected box and its cost. That makes recommendations auditable and prevents the warehouse from losing track of which packaging choice was made.
+
+My recommendation: build this as a Django app with a reusable packing service, a REST endpoint, Django admin for managing products and boxes, and automated tests. The key part to validate carefully is the 3D packing algorithm, because an incorrect fit recommendation can lead to real shipping and fulfillment problems.
+
+
+next
+
+Great. We’ve covered the database models, the initial 3D packing algorithm, and the recommendation API. The next step is to make the system reliable and testable before adding a warehouse interface.
+
+## Step 11: Add automated tests
+
+We’ll test the packing algorithm first, then test the Django API. This is important because the system must never recommend a box that exceeds its weight capacity or incorrectly claims products fit together.
+
+### 11.1 Create the test file
+
+Open `packaging/tests.py` and replace its contents with:
+
+```
+        )    def test_product_too_large(self):        self.assertFalse(            can_pack([(40, 30, 20)], (25, 20, 15))        )    def test_multiple_products_fit_without_overlap(self):        self.assertTrue(            can_pack(                [(10, 10, 10), (10, 10, 10)],                (20, 10, 10),            )        )    def test_volume_alone_does_not_guarantee_fit(self):        # Each item fits individually, but both cannot        # fit side by side in this box.        self.assertFalse(            can_pack(                [(6, 6, 6), (6, 6, 6)],                (10, 10, 10),            )        )class BoxRecommendationTests(TestCase):    def setUp(self):        self.product = Product.objects.create(            name="Keyboard",            length=Decimal("20"),            width=Decimal("15"),            height=Decimal("5"),            weight=Decimal("1.0"),        )        self.order = Order.objects.create(            order_number="ORD-1001"        )        OrderItem.objects.create(            order=self.order,            product=self.product,            quantity=1,        )        ShippingBox.objects.create(            name="Small",            length=Decimal("25"),            width=Decimal("20"),            height=Decimal("10"),            max_weight=Decimal("2"),            cost=Decimal("20"),        )        ShippingBox.objects.create(            name="Medium",            length=Decimal("35"),            width=Decimal("25"),            height=Decimal("15"),            max_weight=Decimal("5"),            cost=Decimal("30"),        )    def test_selects_cheapest_suitable_box(self):        result = recommend_box(self.order)        self.assertTrue(result["success"])        self.assertEqual(result["box"].name, "Small")        self.assertEqual(result["box_cost"], Decimal("20"))    def test_excludes_box_with_insufficient_capacity(self):
+```
+
+### 11.2 Run the tests
+
+In your terminal:
+
+```
+python manage.py test packaging
+```
+
+You should see output similar to:
+
+```
+Found 7 test(s).
+...
+Ran 7 tests
+
+OK
+```
+
+The exact test count may differ if you add more tests.
+
+Important: These tests validate the basic behavior of the greedy packing heuristic, not every possible 3D arrangement. A heuristic can reject an order that actually fits, so more advanced packing tests will be needed before production deployment.
+
+## Step 12: Test the API
+
+Add an API test in `packaging/tests.py`:
+
+```
+from rest_framework.test import APITestCasefrom rest_framework import statusclass RecommendationAPITests(APITestCase):    def test_unknown_order_returns_404(self):        response = self.client.get(            "/api/orders/999999/recommend-box/"        )        self.assertEqual(            response.status_code,            status.HTTP_404_NOT_FOUND,        )
+```
+
+Run the tests again:
+
+```
+python manage.py test packaging
+```
+
+This verifies that requesting a nonexistent order returns a proper HTTP 404 response.
+
+## What comes next?
+
+Once the tests pass, the next phase is to build the warehouse dashboard with these features:
+
+- View all orders waiting for packaging.
+- Select an order and calculate its recommended box.
+- Display the box dimensions, weight capacity and cost.
+- Show a clear message when no suitable box is found.
+- Save the selected box against the order and mark it as packed.
+
+Start by running the tests and fixing any failures. Then we can build the dashboard step by step.
+
+we will build frontend using html,js,css
+
+Perfect. We'll build the frontend using HTML, CSS, and vanilla JavaScript, with Django handling the backend, database, and box recommendation logic. No React is needed.
+
+## Step 13: Set up the frontend
+
+We'll create a clean warehouse dashboard where staff can view orders, request box recommendations, and see packaging costs.
+
+### 13.1 Project structure
+
+Organize your Django project like this:
+
+shipping_system/
+
+packaging/
+
+models.py
+
+services.py
+
+views.py
+
+urls.py
+
+templates/packaging/
+
+dashboard.html
+
+static/packaging/
+
+css/style.css
+
+js/dashboard.js
+
+Create these directories inside your `packaging` app.
+
+```
+mkdir -p packaging/templates/packaging
+mkdir -p packaging/static/packaging/css
+mkdir -p packaging/static/packaging/js
+```
+
+### 13.2 Configure Django templates and static files
+
+In `shipping_system/settings.py`, make sure these settings exist:
+
+```
+TEMPLATES = [    {        "BACKEND": "django.template.backends.django.DjangoTemplates",        "DIRS": [],        "APP_DIRS": True,        "OPTIONS": {            "context_processors": [                "django.template.context_processors.request",                "django.contrib.auth.context_processors.auth",                "django.contrib.messages.context_processors.messages",            ],        },    },]STATIC_URL = "static/"
+```
+
+Django will automatically discover templates and static files inside the `packaging` app.
+
+## Step 14: Create the dashboard page
+
+Create `packaging/templates/packaging/dashboard.html`:
+
+```
+
+{% load static %}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PackWise | Warehouse Dashboard</title>
+    <link rel="stylesheet" href="{% static 'packaging/css/style.css' %}">
+    <script src="{% static 'packaging/js/dashboard.js' %}" defer></script>
+</head>
+<body>
+    <aside class="sidebar">
+        <h2 class="brand">PackWise<span>.</span></h2>
+        <p class="sidebar-label">WORKSPACE</p>
+        <a class="nav-link active" href="/">Dashboard</a>
+        <a class="nav-link" href="/admin/">Manage Inventory</a>
+        <div class="sidebar-footer">Warehouse Operations</div>
+    </aside>
+
+    <main class="main-content">
+        <header class="topbar">
+            <div>
+                <p class="eyebrow">WAREHOUSE / OVERVIEW</p>
+                <h1>Packaging Dashboard</h1>
+                <p class="subtitle">
+                    Find the most cost-effective box for every order.
+                </p>
+            </div>
+            <span class="status-pill">● System ready</span>
+        </header>
+
+        <section class="stats-grid">
+            <article class="stat-card">
+                <p>Order selected</p>
+                <h2 id="selected-order">—</h2>
+            </article>
+            <article class="stat-card">
+                <p>Package weight</p>
+                <h2 id="total-weight">—</h2>
+            </article>
+            <article class="stat-card">
+                <p>Recommended cost</p>
+                <h2 id="box-cost">—</h2>
+            </article>
+        </section>
+
+        <section class="panel">
+            <div class="panel-heading">
+                <div>
+                    <h2>Find a shipping box</h2>
+                    <p>Enter an existing order ID to calculate a recommendation.</p>
+                </div>
+            </div>
+
+            <form id="recommendation-form">
+                <label for="order-id">Order ID</label>
+                <div class="form-row">
+                    <input
+                        type="number"
+                        id="order-id"
+                        min="1"
+                        placeholder="e.g. 1"
+                        required
+                    >
+                    <button type="submit" id="recommend-button">
+                        Recommend box →
+                    </button>
+                </div>
+            </form>
+
+            <p id="feedback" class="feedback" role="status" aria-live="polite">
+                Enter an order ID to get started.
+            </p>
+        </section>
+
+        <section class="panel result-panel" id="result-panel" hidden>
+            <div class="panel-heading">
+                <div>
+                    <p class="eyebrow">RECOMMENDATION</p>
+                    <h2 id="recommended-box">—</h2>
+                </div>
+                <span class="status-pill">Best available match</span>
+            </div>
+
+            <div class="result-grid">
+                <div class="result-item">
+                    <span>Internal dimensions</span>
+                    <strong id="box-dimensions">—</strong>
+                </div>
+                <div class="result-item">
+                    <span>Maximum weight</span>
+                    <strong id="max-weight">—</strong>
+                </div>
+                <div class="result-item">
+                    <span>Total order weight</span>
+                    <strong id="result-weight">—</strong>
+                </div>
+                <div class="result-item">
+                    <span>Box cost</span>
+                    <strong id="result-cost">—</strong>
+                </div>
+            </div>
+        </section>
+    </main>
+</body>
+</html>
+
+```
+
+## Step 15: Style the dashboard
+
+Create `packaging/static/packaging/css/style.css`:
+
+```
+
+:root {
+    font-family: Inter, system-ui, -apple-system, sans-serif;
+    color: #202b3c;
+    background: #f5f7fb;
+    font-synthesis: none;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    min-height: 100vh;
+}
+
+.sidebar {
+    position: fixed;
+    inset: 0 auto 0 0;
+    width: 245px;
+    padding: 32px 22px;
+    background: #172338;
+    color: white;
+}
+
+.brand {
+    font-size: 25px;
+    margin: 0 0 44px;
+}
+
+.brand span {
+    color: #65d6ae;
+}
+
+.sidebar-label,
+.eyebrow {
+    font-size: 11px;
+    letter-spacing: 1.4px;
+    font-weight: 700;
+    color: #8794a8;
+}
+
+.nav-link {
+    display: block;
+    padding: 13px 14px;
+    margin: 8px 0;
+    color: #c5cedc;
+    text-decoration: none;
+    border-radius: 8px;
+}
+
+.nav-link.active {
+    color: white;
+    background: #2b3c55;
+}
+
+.sidebar-footer {
+    position: absolute;
+    bottom: 28px;
+    font-size: 12px;
+    color: #a8b4c5;
+}
+
+.main-content {
+    margin-left: 245px;
+    padding: 38px;
+    max-width: 1500px;
+}
+
+.topbar,
+.panel-heading {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 20px;
+}
+
+h1 {
+    font-size: clamp(26px, 3vw, 34px);
+    margin: 8px 0;
+}
+
+h2 {
+    margin-top: 0;
+}
+
+.subtitle,
+.panel-heading p {
+    color: #778398;
+    font-size: 14px;
+    line-height: 1.6;
+}
+
+.status-pill {
+    display: inline-block;
+    padding: 9px 13px;
+    border-radius: 20px;
+    background: #e4f7ed;
+    color: #16734b;
+    font-size: 12px;
+    white-space: nowrap;
+}
+
+.stats-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 20px;
+    margin: 32px 0;
+}
+
+.stat-card,
+.panel {
+    background: white;
+    border: 1px solid #e7ebf2;
+    border-radius: 14px;
+    padding: 24px;
+    box-shadow: 0 4px 18px rgb(20 40 80 / 3%);
+}
+
+.stat-card p {
+    color: #778398;
+    font-size: 13px;
+}
+
+.stat-card h2 {
+    font-size: 25px;
+    margin: 16px 0 0;
+}
+
+.panel {
+    margin-bottom: 24px;
+}
+
+.panel-heading {
+    margin-bottom: 24px;
+}
+
+.panel-heading h2 {
+    margin-bottom: 5px;
+}
+
+.panel-heading p {
+    margin: 0;
+}
+
+label {
+    display: block;
+    margin-bottom: 9px;
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.form-row {
+    display: flex;
+    gap: 12px;
+}
+
+input {
+    width: 100%;
+    min-width: 0;
+    padding: 13px 15px;
+    border: 1px solid #dce2eb;
+    border-radius: 8px;
+    font: inherit;
+    outline-offset: 2px;
+}
+
+button {
+    padding: 13px 20px;
+    border: 0;
+    border-radius: 8px;
+    background: #2867e8;
+    color: white;
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+button:hover {
+    background: #1d54c4;
+}
+
+button:disabled {
+    opacity: 0.6;
+    cursor: wait;
+}
+
+.feedback {
+    color: #778398;
+    font-size: 13px;
+    margin: 18px 0 0;
+}
+
+.feedback.error {
+    color: #c0392b;
+}
+
+.result-panel {
+    border-top: 3px solid #2eaf7d;
+}
+
+.result-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 24px;
+}
+
+.result-item {
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+}
+
+.result-item span {
+    color: #778398;
+    font-size: 13px;
+}
+
+.result-item strong {
+    font-size: 17px;
+    overflow-wrap: anywhere;
+}
+
+[hidden] {
+    display: none !important;
+}
+
+@media (max-width: 850px) {
+    .sidebar {
+        position: static;
+        width: 100%;
+        padding: 18px;
+    }
+
+    .brand {
+        margin-bottom: 16px;
+    }
+
+    .sidebar-label,
+    .sidebar-footer {
+        display: none;
+    }
+
+    .nav-link {
+        display: inline-block;
+    }
+
+    .main-content {
+        margin-left: 0;
+        padding: 22px;
+    }
+
+    .stats-grid {
+        grid-template-columns: 1fr;
+        gap: 12px;
+    }
+}
+
+@media (max-width: 520px) {
+    .topbar,
+    .panel-heading {
+        align-items: flex-start;
+        flex-direction: column;
+    }
+
+    .form-row {
+        flex-direction: column;
+    }
+
+    .result-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .main-content {
+        padding: 16px;
+    }
+}
+
+```
+
+## Step 16: Connect JavaScript to the Django API
+
+Create `packaging/static/packaging/js/dashboard.js`:
+
+```
+
+const form = document.getElementById("recommendation-form");
+const orderInput = document.getElementById("order-id");
+const button = document.getElementById("recommend-button");
+const feedback = document.getElementById("feedback");
+const resultPanel = document.getElementById("result-panel");
+
+function showFeedback(message, isError = false) {
+    feedback.textContent = message;
+    feedback.classList.toggle("error", isError);
+}
+
+function formatMoney(value) {
+    return new Intl.NumberFormat("en-IN", {
+        style: "currency",
+        currency: "INR",
+    }).format(Number(value));
+}
+
+function displayResult(data) {
+    const box = data.recommended_box;
+
+    document.getElementById("selected-order").textContent =
+        data.order_number;
+
+    document.getElementById("total-weight").textContent =
+        `${data.total_weight_kg} kg`;
+
+    document.getElementById("box-cost").textContent =
+        formatMoney(box.cost);
+
+    document.getElementById("recommended-box").textContent =
+        box.name;
+
+    document.getElementById("box-dimensions").textContent =
+        `${box.dimensions_cm.length} × ` +
+        `${box.dimensions_cm.width} × ` +
+        `${box.dimensions_cm.height} cm`;
+
+    document.getElementById("max-weight").textContent =
+        `${box.maximum_weight_kg} kg`;
+
+    document.getElementById("result-weight").textContent =
+        `${data.total_weight_kg} kg`;
+
+    document.getElementById("result-cost").textContent =
+        formatMoney(box.cost);
+
+    resultPanel.hidden = false;
+}
+
+form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+
+    const orderId = orderInput.value.trim();
+
+    if (!orderId || Number(orderId) < 1) {
+        showFeedback("Please enter a valid order ID.", true);
+        return;
+    }
+
+    button.disabled = true;
+    button.textContent = "Checking boxes...";
+    resultPanel.hidden = true;
+    showFeedback("Calculating the best available box...");
+
+    try {
+        const response = await fetch(
+            `/api/orders/${encodeURIComponent(orderId)}/recommend-box/`,
+            {
+                headers: {
+                    Accept: "application/json",
+                },
+            }
+        );
+
+        const data = await response.json();
+
+        if (!response.ok) {
+            throw new Error(
+                data.error || data.message ||
+                "Unable to recommend a box for this order."
+            );
+        }
+
+        displayResult(data);
+        showFeedback("Recommendation calculated successfully.");
+    } catch (error) {
+        showFeedback(error.message, true);
+    } finally {
+        button.disabled = false;
+        button.textContent = "Recommend box →";
+    }
+});
+
+```
+
+## Step 17: Serve the dashboard from Django
+
+Add this view to `packaging/views.py`:
+
+```
+from django.shortcuts import renderdef dashboard_view(request):    return render(request, "packaging/dashboard.html")
+```
+
+Update `packaging/urls.py`:
+
+```
+from django.urls import pathfrom .views import dashboard_view, recommend_box_viewurlpatterns = [    path("", dashboard_view, name="dashboard"),    path(        "api/orders/<int:order_id>/recommend-box/",        recommend_box_view,        name="recommend-box",    ),]
+```
+
+Your existing project-level `include("packaging.urls")` will serve the dashboard at `/` and the API at `/api/orders/1/recommend-box/`.
+
+### Run and test
+
+```
+python manage.py runserver
+```
+
+1. Open `http://127.0.0.1:8000/`.
+2. Open `http://127.0.0.1:8000/admin/`.
+3. Create some products, shipping boxes, an order, and its order items.
+4. Enter the order's database ID in the dashboard.
+5. Click Recommend box and verify the returned dimensions and cost.
+
+At this stage, you have a working HTML/CSS/JavaScript frontend connected to your Django recommendation API. The next improvement should be an orders table populated from the database, so warehouse staff can select an order instead of manually typing its ID.
+
+
+add a readme file to it
+
+Here’s a complete `README.md` for your Django Shipping Box Recommendation System, including the HTML, CSS, and vanilla JavaScript frontend.
+
+Create a file named `README.md` in the root directory of your project.
+
+````
+
+# PackWise — Shipping Box Recommendation System
+
+A Django-based shipping box recommendation system for ecommerce platforms. PackWise evaluates product dimensions, order weight, box dimensions, weight capacity, and packaging cost to recommend a suitable shipping box for each order.
+
+## Features
+
+- **Product Management:** Store product dimensions and unit weights.
+- **Shipping Box Management:** Maintain box dimensions, maximum weight capacities, costs, and availability.
+- **Order Management:** Create orders and associate products with quantities.
+- **Smart Box Recommendation:** Evaluate available boxes and recommend the lowest-cost suitable option.
+- **3D Packing Heuristic:** Consider rectangular product rotations and non-overlapping placements.
+- **REST API:** Retrieve box recommendations for existing orders.
+- **Warehouse Dashboard:** View recommendations through an HTML, CSS, and JavaScript interface.
+- **Django Admin:** Manage products, boxes, orders, and order items.
+- **Automated Tests:** Test packing behavior, box selection, and API error handling.
+
+## Technology Stack
+
+| Technology | Purpose |
+|---|---|
+| Python | Backend programming |
+| Django | Web framework and ORM |
+| Django REST Framework | Recommendation API |
+| SQLite | Development database |
+| HTML5 | Frontend structure |
+| CSS3 | Responsive dashboard styling |
+| Vanilla JavaScript | API integration and dynamic UI |
+| Django Test Framework | Automated testing |
+
+## Project Structure
+
+```text
+shipping_system/
+├── manage.py
+├── README.md
+├── shipping_system/
+│   ├── __init__.py
+│   ├── settings.py
+│   ├── urls.py
+│   ├── asgi.py
+│   └── wsgi.py
+└── packaging/
+    ├── __init__.py
+    ├── admin.py
+    ├── apps.py
+    ├── models.py
+    ├── services.py
+    ├── views.py
+    ├── urls.py
+    ├── tests.py
+    ├── migrations/
+    ├── templates/
+    │   └── packaging/
+    │       └── dashboard.html
+    └── static/
+        └── packaging/
+            ├── css/
+            │   └── style.css
+            └── js/
+                └── dashboard.js
+```
+
+## Prerequisites
+
+- Python 3.10 or newer
+- pip
+- Git (optional)
+
+## Installation and Setup
+
+### 1. Clone the repository
+
+```bash
+git clone <your-repository-url>
+cd shipping_system
+```
+
+If you have not uploaded the project to GitHub, navigate directly to your project directory instead.
+
+### 2. Create a virtual environment
+
+```bash
+python -m venv venv
+```
+
+Activate it on Linux or macOS:
+
+```bash
+source venv/bin/activate
+```
+
+Activate it on Windows PowerShell:
+
+```powershell
+.\venv\Scripts\Activate.ps1
+```
+
+### 3. Install dependencies
+
+```bash
+pip install django djangorestframework
+```
+
+Save the dependencies for future installations:
+
+```bash
+pip freeze > requirements.txt
+```
+
+### 4. Configure Django
+
+Ensure `rest_framework` and `packaging` are included in `INSTALLED_APPS` in `shipping_system/settings.py`.
+
+Ensure the project-level URL configuration includes the packaging app:
+
+```python
+path("", include("packaging.urls")),
+```
+
+The default SQLite database can be used for local development.
+
+### 5. Apply database migrations
+
+```bash
+python manage.py makemigrations
+python manage.py migrate
+```
+
+### 6. Create an administrator
+
+```bash
+python manage.py createsuperuser
+```
+
+Follow the prompts to configure your admin credentials.
+
+### 7. Start the development server
+
+```bash
+python manage.py runserver
+```
+
+## Access the Application
+
+| Resource | URL |
+|---|---|
+| Warehouse Dashboard | http://127.0.0.1:8000/ |
+| Django Admin | http://127.0.0.1:8000/admin/ |
+| Box Recommendation API | http://127.0.0.1:8000/api/orders/1/recommend-box/ |
+
+Replace `1` with an existing order's database ID.
+
+## How It Works
+
+1. Create products with their length, width, height, and unit weight.
+2. Define shipping boxes with internal dimensions, maximum weight capacity, cost, and active status.
+3. Create an order and add its products with their respective quantities.
+4. Enter the order ID in the warehouse dashboard.
+5. The backend calculates the total product weight.
+6. Boxes that cannot support the total weight are excluded.
+7. The packing heuristic evaluates possible product orientations and placements.
+8. The system returns the lowest-cost box found that passes the packing check.
+9. If no box is found, the API returns an explanatory error response.
+
+## API Documentation
+
+### Recommend a Shipping Box
+
+**Endpoint**
+
+```http
+GET /api/orders/<order_id>/recommend-box/
+```
+
+**Example request**
+
+```bash
+curl http://127.0.0.1:8000/api/orders/1/recommend-box/
+```
+
+**Example successful response**
+
+```json
+{
+  "order_id": 1,
+  "order_number": "ORD-1001",
+  "recommended_box": {
+    "id": 1,
+    "name": "Small",
+    "dimensions_cm": {
+      "length": "25.00",
+      "width": "20.00",
+      "height": "10.00"
+    },
+    "maximum_weight_kg": "2.000",
+    "cost": "20.00"
+  },
+  "total_weight_kg": "1.000"
+}
+```
+
+The response above is illustrative; actual values depend on the records in your database.
+
+### Error Responses
+
+| HTTP status | Meaning |
+|---|---|
+| 404 Not Found | The requested order does not exist. |
+| 422 Unprocessable Entity | No box was found by the recommendation algorithm. |
+
+## Data Model
+
+### Product
+
+Stores the product name, dimensions, and unit weight.
+
+### ShippingBox
+
+Stores the box name, internal dimensions, maximum weight capacity, cost, and whether it is active.
+
+### Order
+
+Represents an ecommerce order with a unique order number and creation timestamp.
+
+### OrderItem
+
+Associates products with orders and records the quantity of each product.
+
+## Packing Logic
+
+The recommendation service:
+
+- Calculates total product weight, including quantities.
+- Filters out inactive boxes and boxes with insufficient weight capacity.
+- Considers 90-degree rotations of rectangular products.
+- Attempts to position products without overlapping.
+- Evaluates boxes in ascending order of cost.
+- Returns the first box for which the heuristic finds a valid arrangement.
+
+**Important limitation:** This implementation uses a greedy 3D packing heuristic. It does not guarantee finding every possible valid arrangement. A failed packing attempt does not prove that a box is physically unsuitable. For production use, consider a stronger packing solver and account for protective packaging, dimensional tolerances, fragile products, and handling restrictions.
+
+## Running Tests
+
+Run the application tests with:
+
+```bash
+python manage.py test packaging
+```
+
+The test suite should cover:
+
+- Product fit and rotation.
+- Oversized products.
+- Multiple-product placement.
+- Lowest-cost box selection.
+- Weight-capacity restrictions.
+- Missing-order API responses.
+
+Add further tests for edge cases as the packing algorithm evolves.
+
+## Future Improvements
+
+- Display all pending orders in the dashboard.
+- Select orders from a table instead of manually entering IDs.
+- Save the recommended box and packaging decision against the order.
+- Add order statuses such as Pending, Recommended, and Packed.
+- Improve 3D packing optimization.
+- Add authentication and role-based permissions for warehouse staff.
+- Add API validation and more detailed error handling.
+- Add PostgreSQL for production deployment.
+- Add audit logs and recommendation history.
+- Deploy the application using Docker and a production-ready web server.
+
+## Contributing
+
+1. Fork the repository.
+2. Create a feature branch.
+3. Make your changes.
+4. Run the test suite.
+5. Submit a pull request.
+
+## License
+
+Specify a license before distributing this project publicly.
+
+````
+
+## Before you commit to GitHub
+
+Check that the README matches your actual implementation, especially the packing heuristic and API response fields.
+
+Run:
+
+```
+python manage.py check
+python manage.py test packaging
+git add README.md requirements.txt
+git commit -m "Add project README and dependency list"
+```
+
+One important note: the sample README documents the features we've designed so far. Features such as saving the selected box, a pending-orders table, and production deployment are listed as future improvements rather than completed functionality.

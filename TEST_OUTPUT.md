@@ -1,0 +1,13 @@
+$ python manage.py check
+System check identified no issues (0 silenced).
+
+$ python manage.py test packaging
+Creating test database for alias 'default'...
+..........
+----------------------------------------------------------------------
+Ran 10 tests in 0.012s
+
+OK
+Destroying test database for alias 'default'...
+Found 10 test(s).
+System check identified no issues (0 silenced).
